@@ -54,6 +54,24 @@ db.exec(`
   );
 `);
 
+function hasTrackedOrdersColumn(columnName) {
+  return db.prepare(`PRAGMA table_info(tracked_orders)`).all()
+    .some((column) => column.name === columnName);
+}
+
+function ensureTrackedOrdersColumn(columnName, columnDefinition) {
+  if (!hasTrackedOrdersColumn(columnName)) {
+    db.exec(`ALTER TABLE tracked_orders ADD COLUMN ${columnName} ${columnDefinition}`);
+  }
+}
+
+ensureTrackedOrdersColumn('http_status', 'INTEGER');
+ensureTrackedOrdersColumn('response_body', 'TEXT');
+ensureTrackedOrdersColumn('response_headers', 'TEXT');
+ensureTrackedOrdersColumn('request_url', 'TEXT');
+ensureTrackedOrdersColumn('integration_identifier', 'TEXT');
+ensureTrackedOrdersColumn('api_key_prefix', 'TEXT');
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -159,6 +177,12 @@ export function markOrderImported(orderId, sectoriceResponse) {
         imported_at = ?,
         skipped_at = NULL,
         last_error = NULL,
+        http_status = NULL,
+        response_body = NULL,
+        response_headers = NULL,
+        request_url = NULL,
+        integration_identifier = NULL,
+        api_key_prefix = NULL,
         sectorice_response = ?
     WHERE order_id = ?
   `).run(nowIso(), JSON.stringify(sectoriceResponse || {}), orderId);
@@ -170,19 +194,54 @@ export function markOrderSkipped(orderId, importStatus, reason) {
     SET import_status = ?,
         skipped_at = ?,
         last_error = ?,
+        http_status = NULL,
+        response_body = NULL,
+        response_headers = NULL,
+        request_url = NULL,
+        integration_identifier = NULL,
+        api_key_prefix = NULL,
         sectorice_response = NULL
     WHERE order_id = ?
   `).run(importStatus, nowIso(), reason || null, orderId);
 }
 
-export function markOrderError(orderId, reason) {
+export function markOrderError(orderId, errorContext = {}) {
+  const reason = typeof errorContext === 'string' ? errorContext : errorContext.reason;
+  const httpStatus = typeof errorContext === 'object' ? (errorContext.httpStatus ?? null) : null;
+  const responseBody = typeof errorContext === 'object' && errorContext.responseBody !== undefined
+    ? JSON.stringify(errorContext.responseBody)
+    : null;
+  const responseHeaders = typeof errorContext === 'object' && errorContext.responseHeaders !== undefined
+    ? JSON.stringify(errorContext.responseHeaders)
+    : null;
+  const requestUrl = typeof errorContext === 'object' ? (errorContext.requestUrl ?? null) : null;
+  const integrationIdentifier = typeof errorContext === 'object'
+    ? (errorContext.integrationIdentifier ?? null)
+    : null;
+  const apiKeyPrefix = typeof errorContext === 'object' ? (errorContext.apiKeyPrefix ?? null) : null;
+
   db.prepare(`
     UPDATE tracked_orders
     SET import_status = 'error_forward',
         last_error = ?,
+        http_status = ?,
+        response_body = ?,
+        response_headers = ?,
+        request_url = ?,
+        integration_identifier = ?,
+        api_key_prefix = ?,
         sectorice_response = NULL
     WHERE order_id = ?
-  `).run(reason || null, orderId);
+  `).run(
+    reason || null,
+    httpStatus,
+    responseBody,
+    responseHeaders,
+    requestUrl,
+    integrationIdentifier,
+    apiKeyPrefix,
+    orderId
+  );
 }
 
 export function listRecentOrders(limit = 20) {
@@ -201,7 +260,13 @@ export function listRecentOrders(limit = 20) {
       last_seen_at,
       imported_at,
       skipped_at,
-      last_error
+      last_error,
+      http_status,
+      response_body,
+      response_headers,
+      request_url,
+      integration_identifier,
+      api_key_prefix
     FROM tracked_orders
     ORDER BY last_seen_at DESC
     LIMIT ?

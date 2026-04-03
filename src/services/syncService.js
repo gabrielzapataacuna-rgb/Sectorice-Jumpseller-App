@@ -102,6 +102,52 @@ function createUploadName(order) {
   return `Jumpseller order ${normalizedOrder.number || normalizedOrder.order_number || normalizedOrder.id}`;
 }
 
+function maskApiKeyPrefix(apiKey) {
+  const normalized = typeof apiKey === 'string' ? apiKey.trim() : '';
+  if (!normalized) {
+    return null;
+  }
+  return `${normalized.slice(0, 4)}***`;
+}
+
+function buildRequestUrl(baseUrl, path) {
+  return `${String(baseUrl || '').replace(/\/$/, '')}${path}`;
+}
+
+function buildForwardErrorContext({ error, trackedOrderId, appConfig }) {
+  const httpStatus = error?.response?.status ?? null;
+  const responseBody = error?.response?.data ?? null;
+  const responseHeaders = error?.response?.headers ?? null;
+  const requestUrl = buildRequestUrl(appConfig.sectoriceApiUrl, '/v1/ecommerce/orders/import');
+  const integrationIdentifier = appConfig.integrationIdentifier || appConfig.jumpsellerStoreUrl || 'sectorice-jumpseller-app';
+  const apiKeyPrefix = maskApiKeyPrefix(appConfig.sectoriceApiKey);
+  const backendMessage = responseBody && typeof responseBody === 'object' ? responseBody.message : null;
+  const reason = backendMessage
+    ? `HTTP ${httpStatus ?? 'unknown'}: ${backendMessage}`
+    : (error instanceof Error ? error.message : 'Error desconocido');
+
+  console.error('[sectorice-jumpseller-app] Forward error', {
+    externalOrderId: trackedOrderId,
+    requestUrl,
+    integrationIdentifier,
+    apiKeyPrefix,
+    httpStatus,
+    responseBody,
+    responseHeaders,
+    message: error instanceof Error ? error.message : String(error),
+  });
+
+  return {
+    reason,
+    httpStatus,
+    responseBody,
+    responseHeaders,
+    requestUrl,
+    integrationIdentifier,
+    apiKeyPrefix,
+  };
+}
+
 export function createJumpsellerSyncService({ appConfig }) {
   let lastSummary = null;
   let currentRun = null;
@@ -205,12 +251,20 @@ export function createJumpsellerSyncService({ appConfig }) {
             continue;
           }
 
-          markOrderError(tracked.orderId, message);
+          const forwardErrorContext = buildForwardErrorContext({
+            error,
+            trackedOrderId: tracked.orderId,
+            appConfig,
+          });
+
+          markOrderError(tracked.orderId, forwardErrorContext);
           summary.errorCount += 1;
           if (summary.status !== 'partial_success') {
             summary.status = 'error';
           }
-          summary.lastError = summary.lastError ? `${summary.lastError} | ${message}` : message;
+          summary.lastError = summary.lastError
+            ? `${summary.lastError} | ${forwardErrorContext.reason}`
+            : forwardErrorContext.reason;
         }
       }
 

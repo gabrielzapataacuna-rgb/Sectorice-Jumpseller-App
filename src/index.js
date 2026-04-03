@@ -29,6 +29,7 @@ const appConfig = {
   pollIntervalMs: Math.max(Number(process.env.JUMPSELLER_POLL_INTERVAL_MS || 60000), 5000),
   sectoriceApiUrl: (process.env.SECTORICE_API_URL || 'https://sectorice.cl').replace(/\/$/, ''),
   sectoriceApiKey: process.env.SECTORICE_API_KEY || '',
+  integrationIdentifier: process.env.SECTORICE_INTEGRATION_CODE || process.env.JUMPSELLER_STORE_URL || 'sectorice-jumpseller-app',
   syncAdminToken: process.env.SYNC_ADMIN_TOKEN || '',
   port: Number(process.env.PORT || 3002),
 };
