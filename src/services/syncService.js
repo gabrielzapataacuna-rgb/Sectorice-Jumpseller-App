@@ -19,7 +19,7 @@ import {
   mapJumpsellerOrderToSectoriceImportItem,
   unwrapJumpsellerOrder,
 } from './jumpsellerMapper.js';
-import { importOrdersToSectorice } from './sectoriceClient.js';
+import { importOrdersToSectorice, listJumpsellerRuntimeIntegrations } from './sectoriceClient.js';
 
 function normalizeStatusToken(value) {
   if (typeof value !== 'string') {
@@ -73,14 +73,16 @@ function evaluateOrderEligibility(order, allowedStatuses) {
   };
 }
 
-function createTrackedOrderRecord(rawOrder, sourceMode) {
+function createTrackedOrderRecord(rawOrder, sourceMode, runtimeIntegration) {
   const order = unwrapJumpsellerOrder(rawOrder);
   const statusSnapshot = getJumpsellerStatusSnapshot(order);
   const rawPayload = JSON.stringify(order);
   const now = new Date().toISOString();
+  const externalOrderId = String(order.id);
+  const scopedOrderId = `${runtimeIntegration.integrationCode}:${externalOrderId}`;
 
   return {
-    orderId: String(order.id),
+    orderId: scopedOrderId,
     orderNumber: order.number != null ? String(order.number) : (order.order_number != null ? String(order.order_number) : null),
     externalStatus: statusSnapshot.externalStatus,
     paymentStatus: statusSnapshot.paymentStatus,
@@ -97,9 +99,9 @@ function createTrackedOrderRecord(rawOrder, sourceMode) {
   };
 }
 
-function createUploadName(order) {
+function createUploadName(order, runtimeIntegration) {
   const normalizedOrder = unwrapJumpsellerOrder(order);
-  return `Jumpseller order ${normalizedOrder.number || normalizedOrder.order_number || normalizedOrder.id}`;
+  return `Jumpseller ${runtimeIntegration.integrationCode} order ${normalizedOrder.number || normalizedOrder.order_number || normalizedOrder.id}`;
 }
 
 function maskApiKeyPrefix(apiKey) {
@@ -114,13 +116,17 @@ function buildRequestUrl(baseUrl, path) {
   return `${String(baseUrl || '').replace(/\/$/, '')}${path}`;
 }
 
-function buildForwardErrorContext({ error, trackedOrderId, appConfig }) {
+function buildForwardErrorContext({ error, trackedOrderId, appConfig, runtimeIntegration }) {
   const httpStatus = error?.response?.status ?? null;
   const responseBody = error?.response?.data ?? null;
   const responseHeaders = error?.response?.headers ?? null;
   const requestUrl = buildRequestUrl(appConfig.sectoriceApiUrl, '/v1/ecommerce/orders/import');
-  const integrationIdentifier = appConfig.integrationIdentifier || appConfig.jumpsellerStoreUrl || 'sectorice-jumpseller-app';
-  const apiKeyPrefix = maskApiKeyPrefix(appConfig.sectoriceApiKey);
+  const integrationIdentifier = runtimeIntegration.integrationCode
+    || runtimeIntegration.storeIdentifier
+    || runtimeIntegration.storeUrl
+    || appConfig.integrationIdentifier
+    || 'sectorice-jumpseller-app';
+  const apiKeyPrefix = maskApiKeyPrefix(runtimeIntegration.sectoriceApiKey);
   const backendMessage = responseBody && typeof responseBody === 'object' ? responseBody.message : null;
   const reason = backendMessage
     ? `HTTP ${httpStatus ?? 'unknown'}: ${backendMessage}`
@@ -146,6 +152,21 @@ function buildForwardErrorContext({ error, trackedOrderId, appConfig }) {
     integrationIdentifier,
     apiKeyPrefix,
   };
+}
+
+async function resolveRuntimeIntegrations(appConfig) {
+  const runtimeIntegrations = await listJumpsellerRuntimeIntegrations({
+    sectoriceApiUrl: appConfig.sectoriceApiUrl,
+    adapterToken: appConfig.internalAdapterToken,
+  }).catch((error) => {
+    console.error('[sectorice-jumpseller-app] Error al cargar runtime de Jumpseller desde backend:', error instanceof Error ? error.message : error);
+    return [];
+  });
+
+  if (runtimeIntegrations.length > 0) {
+    return runtimeIntegrations.filter((integration) => integration?.active !== false);
+  }
+  return [];
 }
 
 export function createJumpsellerSyncService({ appConfig }) {
@@ -181,90 +202,99 @@ export function createJumpsellerSyncService({ appConfig }) {
     };
 
     try {
-      const { orders, pageErrors } = await fetchAllJumpsellerOrders({
-        login: appConfig.jumpsellerLogin,
-        authToken: appConfig.jumpsellerAuthToken,
-        pageSize: appConfig.pageSize,
-        maxPages: appConfig.maxPages,
-      });
-
-      summary.seenCount = orders.length;
-      if (pageErrors.length > 0) {
-        summary.errorCount += pageErrors.length;
-        summary.status = 'partial_success';
-        summary.lastError = pageErrors
-          .map((item) => `page ${item.page}: ${item.message}`)
-          .join(' | ');
-      }
+      const runtimeIntegrations = await resolveRuntimeIntegrations(appConfig);
       const allowedStatuses = resolveAllowedStatuses(appConfig.allowedStatuses);
 
-      for (const rawOrder of orders) {
-        const tracked = createTrackedOrderRecord(rawOrder, sourceMode);
-        const existing = getTrackedOrder(tracked.orderId);
+      for (const runtimeIntegration of runtimeIntegrations) {
+        const { orders, pageErrors } = await fetchAllJumpsellerOrders({
+          login: runtimeIntegration.loginKey,
+          authToken: runtimeIntegration.authToken,
+          accessToken: runtimeIntegration.accessToken,
+          pageSize: appConfig.pageSize,
+          maxPages: appConfig.maxPages,
+        });
 
-        upsertTrackedOrder(tracked);
-
-        if (!force && existing && existing.payload_hash === tracked.payloadHash) {
-          if (existing.import_status === 'imported' || String(existing.import_status || '').startsWith('skipped_')) {
-            summary.unchangedCount += 1;
-            continue;
-          }
-        }
-
-        const eligibility = evaluateOrderEligibility(rawOrder, allowedStatuses);
-        if (!eligibility.allowed) {
-          markOrderSkipped(tracked.orderId, eligibility.importStatus, eligibility.reason);
-          summary.skippedCount += 1;
-          continue;
-        }
-
-        try {
-          const completeness = getJumpsellerCompleteness(rawOrder);
-          if (!completeness.complete) {
-            markOrderSkipped(
-              tracked.orderId,
-              'pending_barcode_only_candidate',
-              `Candidato a JUMPSELLER_BARCODE_ONLY. Faltan: ${completeness.missing.join(', ')}`
-            );
-            summary.skippedCount += 1;
-            continue;
-          }
-
-          const mappedOrder = mapJumpsellerOrderToSectoriceImportItem(rawOrder);
-          const sectoriceResponse = await importOrdersToSectorice({
-            sectoriceApiUrl: appConfig.sectoriceApiUrl,
-            apiKey: appConfig.sectoriceApiKey,
-            payload: {
-              uploadName: createUploadName(rawOrder),
-              confirmOperational: true,
-              orders: [mappedOrder],
-            },
-          });
-
-          markOrderImported(tracked.orderId, sectoriceResponse);
-          summary.importedCount += 1;
-        } catch (error) {
-          const message = error instanceof Error ? error.message : 'Error desconocido';
-          if (message.includes('recipientName') || message.includes('address') || message.includes('comuna')) {
-            markOrderSkipped(tracked.orderId, 'skipped_missing_required_fields', message);
-            summary.skippedCount += 1;
-            continue;
-          }
-
-          const forwardErrorContext = buildForwardErrorContext({
-            error,
-            trackedOrderId: tracked.orderId,
-            appConfig,
-          });
-
-          markOrderError(tracked.orderId, forwardErrorContext);
-          summary.errorCount += 1;
-          if (summary.status !== 'partial_success') {
-            summary.status = 'error';
-          }
+        summary.seenCount += orders.length;
+        if (pageErrors.length > 0) {
+          summary.errorCount += pageErrors.length;
+          summary.status = summary.status === 'success' ? 'partial_success' : summary.status;
+          const pageErrorMessage = pageErrors
+            .map((item) => `${runtimeIntegration.integrationCode} page ${item.page}: ${item.message}`)
+            .join(' | ');
           summary.lastError = summary.lastError
-            ? `${summary.lastError} | ${forwardErrorContext.reason}`
-            : forwardErrorContext.reason;
+            ? `${summary.lastError} | ${pageErrorMessage}`
+            : pageErrorMessage;
+        }
+
+        for (const rawOrder of orders) {
+          const tracked = createTrackedOrderRecord(rawOrder, sourceMode, runtimeIntegration);
+          const existing = getTrackedOrder(tracked.orderId);
+
+          upsertTrackedOrder(tracked);
+
+          if (!force && existing && existing.payload_hash === tracked.payloadHash) {
+            if (existing.import_status === 'imported' || String(existing.import_status || '').startsWith('skipped_')) {
+              summary.unchangedCount += 1;
+              continue;
+            }
+          }
+
+          const eligibility = evaluateOrderEligibility(rawOrder, allowedStatuses);
+          if (!eligibility.allowed) {
+            markOrderSkipped(tracked.orderId, eligibility.importStatus, eligibility.reason);
+            summary.skippedCount += 1;
+            continue;
+          }
+
+          try {
+            const completeness = getJumpsellerCompleteness(rawOrder);
+            if (!completeness.complete) {
+              markOrderSkipped(
+                tracked.orderId,
+                'pending_barcode_only_candidate',
+                `Candidato a JUMPSELLER_BARCODE_ONLY. Faltan: ${completeness.missing.join(', ')}`
+              );
+              summary.skippedCount += 1;
+              continue;
+            }
+
+            const mappedOrder = mapJumpsellerOrderToSectoriceImportItem(rawOrder);
+            const sectoriceResponse = await importOrdersToSectorice({
+              sectoriceApiUrl: appConfig.sectoriceApiUrl,
+              apiKey: runtimeIntegration.sectoriceApiKey,
+              payload: {
+                uploadName: createUploadName(rawOrder, runtimeIntegration),
+                confirmOperational: true,
+                orders: [mappedOrder],
+              },
+            });
+
+            markOrderImported(tracked.orderId, sectoriceResponse);
+            summary.importedCount += 1;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : 'Error desconocido';
+            if (message.includes('recipientName') || message.includes('address') || message.includes('comuna')) {
+              markOrderSkipped(tracked.orderId, 'skipped_missing_required_fields', message);
+              summary.skippedCount += 1;
+              continue;
+            }
+
+            const forwardErrorContext = buildForwardErrorContext({
+              error,
+              trackedOrderId: tracked.orderId,
+              appConfig,
+              runtimeIntegration,
+            });
+
+            markOrderError(tracked.orderId, forwardErrorContext);
+            summary.errorCount += 1;
+            if (summary.status !== 'partial_success') {
+              summary.status = 'error';
+            }
+            summary.lastError = summary.lastError
+              ? `${summary.lastError} | ${forwardErrorContext.reason}`
+              : forwardErrorContext.reason;
+          }
         }
       }
 

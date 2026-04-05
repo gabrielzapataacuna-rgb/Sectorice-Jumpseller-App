@@ -9,19 +9,29 @@ function createJumpsellerHttpClient() {
 
 export async function listJumpsellerOrders({ login, authToken, page = 1, limit = 50 }) {
   const client = createJumpsellerHttpClient();
-  const response = await client.get('/orders.json', {
+  const requestConfig = {
     params: {
-      login,
-      authtoken: authToken,
       page,
       limit,
     },
-  });
+    headers: {},
+  };
+
+  if (typeof login === 'string' && login.trim() && typeof authToken === 'string' && authToken.trim()) {
+    requestConfig.params.login = login;
+    requestConfig.params.authtoken = authToken;
+  } else if (typeof authToken === 'string' && authToken.trim()) {
+    requestConfig.headers.Authorization = `Bearer ${authToken.trim()}`;
+  } else {
+    throw new Error('No hay credenciales Jumpseller válidas para consultar pedidos.');
+  }
+
+  const response = await client.get('/orders.json', requestConfig);
 
   return Array.isArray(response.data) ? response.data : [];
 }
 
-export async function fetchAllJumpsellerOrders({ login, authToken, pageSize, maxPages }) {
+export async function fetchAllJumpsellerOrders({ login, authToken, accessToken, pageSize, maxPages }) {
   const allOrders = [];
   const pageErrors = [];
 
@@ -30,7 +40,7 @@ export async function fetchAllJumpsellerOrders({ login, authToken, pageSize, max
     try {
       pageOrders = await listJumpsellerOrders({
         login,
-        authToken,
+        authToken: accessToken || authToken,
         page,
         limit: pageSize,
       });
