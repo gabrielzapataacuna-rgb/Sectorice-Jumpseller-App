@@ -7,13 +7,14 @@ function createJumpsellerHttpClient() {
   });
 }
 
-export async function listJumpsellerOrders({ login, authToken, page = 1, limit = 50 }) {
+export async function listJumpsellerOrders({ login, authToken, page = 1, limit = 50, since = null }) {
   const client = createJumpsellerHttpClient();
+  const params = { page, limit };
+  if (since) {
+    params.since = since;
+  }
   const requestConfig = {
-    params: {
-      page,
-      limit,
-    },
+    params,
     headers: {},
   };
 
@@ -31,7 +32,7 @@ export async function listJumpsellerOrders({ login, authToken, page = 1, limit =
   return Array.isArray(response.data) ? response.data : [];
 }
 
-export async function fetchAllJumpsellerOrders({ login, authToken, accessToken, pageSize, maxPages }) {
+export async function fetchAllJumpsellerOrders({ login, authToken, accessToken, pageSize, maxPages, since = null }) {
   const allOrders = [];
   const pageErrors = [];
 
@@ -43,6 +44,7 @@ export async function fetchAllJumpsellerOrders({ login, authToken, accessToken, 
         authToken: accessToken || authToken,
         page,
         limit: pageSize,
+        since,
       });
     } catch (error) {
       pageErrors.push({

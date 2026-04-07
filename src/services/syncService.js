@@ -206,12 +206,14 @@ export function createJumpsellerSyncService({ appConfig }) {
       const allowedStatuses = resolveAllowedStatuses(appConfig.allowedStatuses);
 
       for (const runtimeIntegration of runtimeIntegrations) {
+        const since = runtimeIntegration.connectedAt || null;
         const { orders, pageErrors } = await fetchAllJumpsellerOrders({
           login: runtimeIntegration.loginKey,
           authToken: runtimeIntegration.authToken,
           accessToken: runtimeIntegration.accessToken,
           pageSize: appConfig.pageSize,
           maxPages: appConfig.maxPages,
+          since,
         });
 
         summary.seenCount += orders.length;
